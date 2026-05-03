@@ -6,3 +6,4 @@ runtime/
 *.tmp
 .env
 config.env
+ref_*/
