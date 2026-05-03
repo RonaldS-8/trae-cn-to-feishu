@@ -52,42 +52,47 @@ export class JsonFileStore implements BridgeStore {
   private locks = new Map<string, LockEntry>();
   private auditLog: Array<AuditLogInput & { id: string; createdAt: string }> = [];
 
-  constructor(settingsMap: Map<string, string>) {
+  private dataDir: string;
+  private messagesDir: string;
+
+  constructor(settingsMap: Map<string, string>, customDataDir?: string) {
     this.settings = settingsMap;
-    ensureDir(DATA_DIR);
-    ensureDir(MESSAGES_DIR);
+    this.dataDir = customDataDir || DATA_DIR;
+    this.messagesDir = path.join(this.dataDir, 'messages');
+    ensureDir(this.dataDir);
+    ensureDir(this.messagesDir);
     this.loadAll();
   }
 
   private loadAll(): void {
-    for (const [id, s] of Object.entries(readJson<Record<string, BridgeSession>>(path.join(DATA_DIR, 'sessions.json'), {}))) {
+    for (const [id, s] of Object.entries(readJson<Record<string, BridgeSession>>(path.join(this.dataDir, 'sessions.json'), {}))) {
       this.sessions.set(id, s);
     }
-    for (const [key, b] of Object.entries(readJson<Record<string, ChannelBinding>>(path.join(DATA_DIR, 'bindings.json'), {}))) {
+    for (const [key, b] of Object.entries(readJson<Record<string, ChannelBinding>>(path.join(this.dataDir, 'bindings.json'), {}))) {
       this.bindings.set(key, b);
     }
-    for (const [id, p] of Object.entries(readJson<Record<string, PermissionLinkRecord>>(path.join(DATA_DIR, 'permissions.json'), {}))) {
+    for (const [id, p] of Object.entries(readJson<Record<string, PermissionLinkRecord>>(path.join(this.dataDir, 'permissions.json'), {}))) {
       this.permissionLinks.set(id, p);
     }
-    for (const [k, v] of Object.entries(readJson<Record<string, string>>(path.join(DATA_DIR, 'offsets.json'), {}))) {
+    for (const [k, v] of Object.entries(readJson<Record<string, string>>(path.join(this.dataDir, 'offsets.json'), {}))) {
       this.offsets.set(k, v);
     }
-    for (const [k, v] of Object.entries(readJson<Record<string, number>>(path.join(DATA_DIR, 'dedup.json'), {}))) {
+    for (const [k, v] of Object.entries(readJson<Record<string, number>>(path.join(this.dataDir, 'dedup.json'), {}))) {
       this.dedupKeys.set(k, v);
     }
-    this.auditLog = readJson(path.join(DATA_DIR, 'audit.json'), []);
+    this.auditLog = readJson(path.join(this.dataDir, 'audit.json'), []);
   }
 
-  private persistSessions(): void { writeJson(path.join(DATA_DIR, 'sessions.json'), Object.fromEntries(this.sessions)); }
-  private persistBindings(): void { writeJson(path.join(DATA_DIR, 'bindings.json'), Object.fromEntries(this.bindings)); }
-  private persistPermissions(): void { writeJson(path.join(DATA_DIR, 'permissions.json'), Object.fromEntries(this.permissionLinks)); }
-  private persistOffsets(): void { writeJson(path.join(DATA_DIR, 'offsets.json'), Object.fromEntries(this.offsets)); }
-  private persistDedup(): void { writeJson(path.join(DATA_DIR, 'dedup.json'), Object.fromEntries(this.dedupKeys)); }
-  private persistAudit(): void { writeJson(path.join(DATA_DIR, 'audit.json'), this.auditLog); }
-  private persistMessages(sessionId: string): void { writeJson(path.join(MESSAGES_DIR, `${sessionId}.json`), this.messages.get(sessionId) || []); }
+  private persistSessions(): void { writeJson(path.join(this.dataDir, 'sessions.json'), Object.fromEntries(this.sessions)); }
+  private persistBindings(): void { writeJson(path.join(this.dataDir, 'bindings.json'), Object.fromEntries(this.bindings)); }
+  private persistPermissions(): void { writeJson(path.join(this.dataDir, 'permissions.json'), Object.fromEntries(this.permissionLinks)); }
+  private persistOffsets(): void { writeJson(path.join(this.dataDir, 'offsets.json'), Object.fromEntries(this.offsets)); }
+  private persistDedup(): void { writeJson(path.join(this.dataDir, 'dedup.json'), Object.fromEntries(this.dedupKeys)); }
+  private persistAudit(): void { writeJson(path.join(this.dataDir, 'audit.json'), this.auditLog); }
+  private persistMessages(sessionId: string): void { writeJson(path.join(this.messagesDir, `${sessionId}.json`), this.messages.get(sessionId) || []); }
   private loadMessages(sessionId: string): BridgeMessage[] {
     if (this.messages.has(sessionId)) return this.messages.get(sessionId)!;
-    const msgs = readJson<BridgeMessage[]>(path.join(MESSAGES_DIR, `${sessionId}.json`), []);
+    const msgs = readJson<BridgeMessage[]>(path.join(this.messagesDir, `${sessionId}.json`), []);
     this.messages.set(sessionId, msgs);
     return msgs;
   }
