@@ -2,6 +2,17 @@
 
 > 开发完成后删除此文件
 
+## MVP状态: ✅ 全部完成 (17/17 测试通过)
+
+| 阶段 | 状态 | 文件 |
+|------|------|------|
+| MVP-1: 核心类型 + DI + 配置 | ✅ | types.ts, context.ts, config.ts, host.ts |
+| MVP-2: 飞书适配器 | ✅ | feishu-adapter.ts, feishu-markdown.ts |
+| MVP-3: 窗口自动化提供者 | ✅ | window-provider.ts, trae_window.py, trae_monitor.py |
+| MVP-4: 对话引擎 + 投递 + 桥接 | ✅ | conversation-engine.ts, delivery-layer.ts, bridge-manager.ts, permission-broker.ts, validators.ts |
+| MVP-5: 存储 + 日志 + 入口 | ✅ | store.ts, logger.ts, main.ts |
+| MVP集成测试 | ✅ 17/17 | integration.test.ts |
+
 ## 架构总览
 
 ```
