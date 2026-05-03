@@ -5,6 +5,7 @@ import * as engine from './conversation-engine.js';
 import * as broker from './permission-broker.js';
 import { deliver } from './delivery-layer.js';
 import { sanitizeInput } from './security/validators.js';
+import { detectMode, parseModelCommand, parseModeCommand, buildModeAnnouncement, shouldAutoDetect } from './mode-detector.js';
 
 const GLOBAL_KEY = '__traecn_feishu_bridge_manager__';
 
@@ -162,8 +163,65 @@ async function handleMessage(adapter: FeishuAdapter, msg: InboundMessage): Promi
     return;
   }
 
+  const modelCmd = parseModelCommand(sanitized);
+  if (modelCmd) {
+    const binding = resolveBinding(adapter, msg);
+    if (binding) {
+      try { store.updateSessionModel(binding.sessionId, modelCmd); } catch { /* best effort */ }
+    }
+    await deliver(adapter, {
+      address: msg.address,
+      text: `🔄 Model switched to: ${modelCmd}`,
+      parseMode: 'plain',
+    });
+    return;
+  }
+
+  const modeCmd = parseModeCommand(sanitized);
+  if (modeCmd) {
+    const binding = resolveBinding(adapter, msg);
+    if (binding) {
+      try { store.updateChannelBinding(binding.id, { mode: modeCmd }); } catch { /* best effort */ }
+    }
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildModeAnnouncement(modeCmd),
+      parseMode: 'plain',
+    });
+    return;
+  }
+
+  const helpMatch = sanitized.match(/^\/(help|帮助)$/i);
+  if (helpMatch) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: [
+        '🤖 **TraeCN-to-IM Bridge Commands**',
+        '',
+        '/mode code — Switch to Code mode (AI can edit files)',
+        '/mode plan — Switch to Plan mode (AI plans first)',
+        '/mode ask — Switch to Ask mode (Q&A only)',
+        '/model <name> — Switch AI model',
+        '/perm allow <id> — Approve permission request',
+        '/perm deny <id> — Deny permission request',
+        '/help — Show this help',
+      ].join('\n'),
+      parseMode: 'Markdown',
+    });
+    return;
+  }
+
   const binding = resolveBinding(adapter, msg);
   if (!binding) return;
+
+  let effectiveMode = binding.mode;
+  if (shouldAutoDetect(binding)) {
+    const detection = detectMode(sanitized, binding.mode);
+    if (detection.confidence > 0.5 && detection.mode !== binding.mode) {
+      effectiveMode = detection.mode;
+      try { store.updateChannelBinding(binding.id, { mode: effectiveMode }); } catch { /* best effort */ }
+    }
+  }
 
   processWithSessionLock(binding.sessionId, async () => {
     adapter.onMessageStart(msg.address.chatId);
@@ -189,7 +247,7 @@ async function handleMessage(adapter: FeishuAdapter, msg: InboundMessage): Promi
         undefined,
         msg.attachments,
         (fullText) => {
-          adapter.onStreamText(msg.address.chatId, fullText);
+          adapter.onStreamText(msg.address.chatId, fullText, activeTools);
         },
         (toolId, toolName, status) => {
           const idx = activeTools.findIndex(t => t.id === toolId);

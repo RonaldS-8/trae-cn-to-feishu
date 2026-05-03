@@ -9,7 +9,10 @@ import {
   buildPostContent,
   htmlToFeishuMarkdown,
   buildPermissionButtonCard,
+  buildResolvedPermissionCard,
+  buildStreamingCard,
 } from './feishu-markdown.js';
+import type { ToolCallInfo } from '../core/types.js';
 
 const DEDUP_MAX = 1000;
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
@@ -44,6 +47,7 @@ interface EditPreviewState {
   lastSentAt: number;
   throttleTimer: ReturnType<typeof setTimeout> | null;
   pendingText: string;
+  activeTools: ToolCallInfo[];
 }
 
 export class FeishuAdapter {
@@ -206,7 +210,7 @@ export class FeishuAdapter {
     }).catch(() => { /* ignore */ });
   }
 
-  onStreamText(chatId: string, fullText: string): void {
+  onStreamText(chatId: string, fullText: string, tools?: ToolCallInfo[]): void {
     let state = this.activePreviews.get(chatId);
     if (!state) {
       state = {
@@ -216,10 +220,12 @@ export class FeishuAdapter {
         lastSentAt: 0,
         throttleTimer: null,
         pendingText: '',
+        activeTools: [],
       };
       this.activePreviews.set(chatId, state);
     }
     state.pendingText = fullText;
+    if (tools) state.activeTools = tools;
 
     const elapsed = Date.now() - state.lastSentAt;
     if (elapsed < EDIT_THROTTLE_MS && state.lastSentAt > 0) {
@@ -400,6 +406,20 @@ export class FeishuAdapter {
       const userId = event?.operator?.open_id || '';
       if (!chatId) return FALLBACK_TOAST;
 
+      if (callbackData.startsWith('perm:')) {
+        const parts = callbackData.split(':');
+        const action = parts[1] as 'allow' | 'allow_session' | 'deny';
+        if (messageId && this.restClient) {
+          try {
+            const resolvedCard = buildResolvedPermissionCard('Permission request', action);
+            await this.restClient.im.message.patch({
+              path: { message_id: messageId },
+              data: { content: JSON.stringify({ type: 'card', data: JSON.parse(resolvedCard) }) },
+            });
+          } catch { /* best effort */ }
+        }
+      }
+
       const callbackMsg: InboundMessage = {
         messageId: messageId || `card_action_${Date.now()}`,
         address: { channelType: 'feishu', chatId, userId },
@@ -475,12 +495,17 @@ export class FeishuAdapter {
     state.lastSentText = text;
     state.lastSentAt = Date.now();
 
-    const processedText = preprocessFeishuMarkdown(text);
-    const content = hasComplexMarkdown(processedText)
-      ? JSON.stringify({ type: 'card', data: JSON.parse(buildCardContent(processedText)) })
-      : JSON.stringify({ type: 'post', data: JSON.parse(buildPostContent(processedText)) });
+    const hasTools = state.activeTools.length > 0;
+    const content = hasTools
+      ? JSON.stringify({ type: 'card', data: JSON.parse(buildStreamingCard(text, state.activeTools)) })
+      : (() => {
+          const processedText = preprocessFeishuMarkdown(text);
+          return hasComplexMarkdown(processedText)
+            ? JSON.stringify({ type: 'card', data: JSON.parse(buildCardContent(processedText)) })
+            : JSON.stringify({ type: 'post', data: JSON.parse(buildPostContent(processedText)) });
+        })();
 
-    const msgType = hasComplexMarkdown(processedText) ? 'interactive' : 'post';
+    const msgType = hasTools || hasComplexMarkdown(preprocessFeishuMarkdown(text)) ? 'interactive' : 'post';
 
     if (state.messageId) {
       this.restClient.im.message.patch({

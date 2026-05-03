@@ -56,15 +56,39 @@ export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   return lines.join('\n');
 }
 
+export function buildStreamingCard(text: string, tools: ToolCallInfo[]): string {
+  const elements: unknown[] = [];
+
+  const toolSection = buildToolProgressMarkdown(tools);
+  if (toolSection) {
+    elements.push({ tag: 'markdown', content: toolSection });
+    elements.push({ tag: 'hr' });
+  }
+
+  const displayText = text.length > 28000 ? text.slice(0, 28000) + '\n...' : text;
+  elements.push({ tag: 'markdown', content: displayText });
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '🤖 Trae AI' },
+      template: 'blue',
+      ud_icon: 'chat_colorful',
+    },
+    body: { elements },
+  });
+}
+
 export function buildPermissionButtonCard(
   text: string,
   permissionRequestId: string,
   chatId?: string,
 ): string {
   const buttons = [
-    { label: 'Allow', type: 'primary', action: 'allow' },
-    { label: 'Allow Session', type: 'default', action: 'allow_session' },
-    { label: 'Deny', type: 'danger', action: 'deny' },
+    { label: '✅ Allow', type: 'primary', action: 'allow' },
+    { label: '🔓 Allow Session', type: 'default', action: 'allow_session' },
+    { label: '❌ Deny', type: 'danger', action: 'deny' },
   ];
 
   const buttonColumns = buttons.map(btn => ({
@@ -87,6 +111,7 @@ export function buildPermissionButtonCard(
     header: {
       title: { tag: 'plain_text', content: '⚠️ Permission Required' },
       template: 'orange',
+      ud_icon: 'confirm_colorful',
     },
     body: {
       elements: [
@@ -96,6 +121,30 @@ export function buildPermissionButtonCard(
           tag: 'column_set',
           columns: buttonColumns,
         },
+      ],
+    },
+  });
+}
+
+export function buildResolvedPermissionCard(
+  originalText: string,
+  action: 'allow' | 'allow_session' | 'deny',
+): string {
+  const isAllow = action.startsWith('allow');
+  const template = isAllow ? 'green' : 'red';
+  const icon = isAllow ? '✅' : '❌';
+  const label = action === 'allow' ? 'Allowed (once)' : action === 'allow_session' ? 'Allowed for session' : 'Denied';
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `${icon} Permission ${label}` },
+      template,
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: originalText },
       ],
     },
   });
