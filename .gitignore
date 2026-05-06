@@ -7,3 +7,5 @@ runtime/
 .env
 config.env
 ref_*/
+TECHNICAL_DOC.md
+DEVELOPMENT_PLAN.md

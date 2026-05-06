@@ -1,846 +1,647 @@
 # TraeCN-to-Feishu 技术文档
 
-## 目录
+本文面向想学习本项目实现方式的读者，尽量把系统设计、消息流、窗口自动化、飞书适配和调试方法讲清楚。
 
-1. [架构概览](#1-架构概览)
-2. [核心模块详解](#2-核心模块详解)
-3. [消息流转全链路](#3-消息流转全链路)
-4. [模型提供者体系](#4-模型提供者体系)
-5. [飞书适配器](#5-飞书适配器)
-6. [流式输出机制](#6-流式输出机制)
-7. [权限管理](#7-权限管理)
-8. [模式检测与多模型调度](#8-模式检测与多模型调度)
-9. [存储层](#9-存储层)
-10. [API Server](#10-api-server)
-11. [安全设计](#11-安全设计)
-12. [配置系统](#12-配置系统)
-13. [日志系统](#13-日志系统)
-14. [部署与运维](#14-部署与运维)
+## 1. 项目目标
 
----
+Trae CN 是桌面 IDE，飞书是 IM 平台。这个项目要做的事情是：
 
-## 1. 架构概览
+1. 用户在飞书里给机器人发消息。
+2. Node.js 桥接服务通过飞书长连接收到消息。
+3. 桥接服务把消息发送给 Trae CN。
+4. Trae CN 的 Builder 生成回复。
+5. 桥接服务读取 Trae 窗口里的回复。
+6. 桥接服务把回复发回飞书。
 
-### 1.1 系统架构图
+当前最重要的实现路径是 `window` 模式，也就是 Windows 屏幕自动化。它不需要修改 Trae，也不依赖 Trae 插件 API，但代价是要面对 UIA 控件树不稳定、富文本拆分、窗口必须可见等问题。
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        飞书 (Lark)                          │
-│                   IM Platform / User Side                   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ WebSocket (长连接)
-                       │ @larksuiteoapi/node-sdk WSClient
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  桥接守护进程 (Bridge Daemon)                 │
-│                                                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ FeishuAdapter│  │ BridgeManager│  │   API Server     │  │
-│  │  (消息收发)   │  │  (编排调度)   │  │  (端口3100)      │  │
-│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘  │
-│         │                 │                     │            │
-│  ┌──────┴───────┐  ┌──────┴───────┐            │            │
-│  │ DeliveryLayer│  │ Conversation │            │            │
-│  │  (投递/重试)  │  │   Engine     │            │            │
-│  └──────────────┘  └──────┬───────┘            │            │
-│                           │                     │            │
-│              ┌────────────┴────────────┐        │            │
-│              │    AutoLLMProvider      │        │            │
-│              │  (自动降级调度)           │        │            │
-│              └───┬────────────────┬────┘        │            │
-│                  │                │              │            │
-│     ┌────────────▼──────┐ ┌──────▼───────────┐  │            │
-│     │ExtensionLLMProvider│ │WindowLLMProvider │  │            │
-│     │  (HTTP API主路径)   │ │(窗口自动化降级)   │  │            │
-│     └────────┬──────────┘ └──────┬───────────┘  │            │
-│              │                   │              │            │
-│  ┌───────────┴───────────────────┴──────────────┴──────────┐ │
-│  │                    JsonFileStore                        │ │
-│  │              (JSON文件持久化存储)                         │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-                       │                       │
-          HTTP API (端口3000)          pywinauto (键盘模拟)
-                       │                       │
-                       ▼                       ▼
-┌──────────────────────────┐  ┌──────────────────────────────┐
-│    Trae CN 扩展端点       │  │     Trae CN 窗口             │
-│  (本地HTTP/SSE服务)       │  │   (pywinauto自动化)          │
-└──────────────────────────┘  └──────────────────────────────┘
+## 2. 总体架构
+
+```text
+Feishu user
+  |
+  | im.message.receive_v1
+  v
+FeishuAdapter
+  |
+  v
+BridgeManager
+  |
+  v
+ConversationEngine
+  |
+  v
+WindowLLMProvider
+  |
+  | Python scripts
+  v
+Trae CN window
+  |
+  | UIA text / raw UI JSON
+  v
+FeishuAdapter.send()
+  |
+  v
+Feishu chat
 ```
 
-### 1.2 设计原则
+核心模块：
 
-| 原则 | 实现方式 |
-|------|---------|
-| 依赖注入 (DI) | `BridgeContext` 通过 `globalThis` 注入，所有模块通过 `getBridgeContext()` 获取依赖 |
-| 接口抽象 | `LLMProvider`、`BridgeStore`、`PermissionGateway` 等核心接口定义在 `host.ts` |
-| 自动降级 | `AutoLLMProvider` 优先Extension API，失败3次后降级到窗口自动化 |
-| 最小依赖 | 仅依赖 `@larksuiteoapi/node-sdk`，零外部HTTP框架 |
-| 零数据库 | JSON文件持久化，无需安装数据库 |
+| 模块 | 文件 | 作用 |
+| --- | --- | --- |
+| 入口 | `src/main.ts` | 加载配置、初始化上下文、启动 API Server 和飞书适配器 |
+| 配置 | `src/config.ts` | 读取 `.traecn-to-feishu/config.env` |
+| 飞书适配 | `src/feishu/feishu-adapter.ts` | 接收飞书事件、发送飞书消息 |
+| 编排 | `src/core/bridge-manager.ts` | 消息循环、命令处理、会话锁 |
+| 对话引擎 | `src/core/conversation-engine.ts` | 调用 LLMProvider 并消费 SSE |
+| Provider | `src/providers/window-provider.ts` | 调用 Python 脚本发送消息和监测回复 |
+| 窗口发送 | `scripts/trae_window.py` | 定位 Trae 输入框、粘贴消息、回车 |
+| 窗口监测 | `scripts/trae_monitor.py` | 读取 Trae Builder 回复 |
+| UIA dump | `scripts/dump_ui.py` | 打印 Trae 窗口控件树 |
+| 存储 | `src/store.ts` | JSON 文件持久化 |
+| 日志 | `src/logger.ts` | 文件日志和敏感信息遮蔽 |
 
-### 1.3 目录结构
+## 3. 配置加载
 
-```
-src/
-├── core/                    # 核心抽象层
-│   ├── types.ts             # 共享类型定义
-│   ├── host.ts              # 接口定义 (LLMProvider, BridgeStore等)
-│   ├── context.ts           # DI容器
-│   ├── bridge-manager.ts    # 桥接编排器 (消息流转总控)
-│   ├── conversation-engine.ts # 对话引擎 (SSE流消费)
-│   ├── delivery-layer.ts    # 消息投递 (分块/重试/去重)
-│   ├── permission-broker.ts # 权限代理 (飞书卡片权限)
-│   ├── mode-detector.ts     # 上下文感知模式检测
-│   └── security/
-│       └── validators.ts    # 输入校验
-├── feishu/                  # 飞书适配层
-│   ├── feishu-adapter.ts    # 飞书消息收发 + 流式编辑
-│   └── feishu-markdown.ts   # Markdown→飞书格式转换
-├── providers/               # 模型提供者
-│   ├── auto-provider.ts     # 自动降级调度
-│   ├── extension-provider.ts # Extension API (HTTP)
-│   └── window-provider.ts   # 窗口自动化 (pywinauto)
-├── api-server.ts            # 本地HTTP API Server
-├── config.ts                # 配置管理
-├── store.ts                 # JSON文件存储实现
-├── logger.ts                # 日志 (密钥脱敏)
-├── sse-utils.ts             # SSE事件格式化
-└── main.ts                  # 守护进程入口
-scripts/
-├── trae_window.py           # 窗口注入脚本
-└── trae_monitor.py          # 响应监控脚本
+默认配置目录：
+
+```text
+<project>/.traecn-to-feishu/
 ```
 
----
+默认配置文件：
 
-## 2. 核心模块详解
-
-### 2.1 类型系统 (`types.ts` + `host.ts`)
-
-类型系统分为两层：
-
-- **`types.ts`**：数据传输对象 (DTO)，定义消息、通道、SSE事件等结构
-- **`host.ts`**：接口契约，定义 `LLMProvider`、`BridgeStore`、`PermissionGateway` 等抽象
-
-**核心类型关系：**
-
-```
-InboundMessage                    OutboundMessage
-├── messageId                     ├── address: ChannelAddress
-├── address: ChannelAddress       ├── text: string
-├── text: string                  ├── parseMode: 'HTML'|'Markdown'|'plain'
-├── timestamp: number             ├── inlineButtons: InlineButton[][]
-├── callbackData?: string         └── replyToMessageId?: string
-└── attachments?: FileAttachment
-
-ChannelBinding                    BridgeSession
-├── id: string                    ├── id: string
-├── channelType: string           ├── working_directory: string
-├── chatId: string                ├── model: string
-├── sessionId: string             └── system_prompt?: string
-├── workingDirectory: string
-├── model: string
-└── mode: 'code'|'plan'|'ask'
+```text
+<project>/.traecn-to-feishu/config.env
 ```
 
-**`LLMProvider` 接口：**
+`src/config.ts` 中：
 
-```typescript
-interface LLMProvider {
-  streamChat(params: StreamChatParams): ReadableStream<string>;
+```ts
+export const CTI_HOME = process.env.CTI_HOME || path.join(process.cwd(), '.traecn-to-feishu');
+export const CONFIG_PATH = path.join(CTI_HOME, 'config.env');
+```
+
+这意味着，如果不设置 `CTI_HOME`，配置和数据目录都在当前项目根目录下。
+
+### 3.1 关键配置
+
+| 配置 | 说明 |
+| --- | --- |
+| `CTI_RUNTIME` | `window` / `extension` / `auto`，当前推荐 `window` |
+| `CTI_FEISHU_APP_ID` | 飞书自建应用 App ID |
+| `CTI_FEISHU_APP_SECRET` | 飞书自建应用 App Secret |
+| `CTI_FEISHU_DOMAIN` | 国内飞书用 `feishu`，海外 Lark 用 `lark` |
+| `CTI_DEFAULT_WORKDIR` | Trae 当前项目目录 |
+| `CTI_DEFAULT_MODEL` | 模型名记录 |
+| `CTI_PYTHON_PATH` | Python 解释器路径 |
+| `CTI_MONITOR_DEBUG` | 为 `true` 时返回 raw UIA JSON |
+| `CTI_TRAE_MSG_SUFFIX` | 发送给 Trae 时追加的后缀 |
+
+### 3.2 Python 环境变量注入
+
+`loadConfig()` 会把部分配置写入 `process.env`，这样 Node 调 Python 子进程时能继承：
+
+```ts
+const pythonPath = env.get('CTI_PYTHON_PATH');
+if (pythonPath && !process.env.CTI_PYTHON_PATH) {
+  process.env.CTI_PYTHON_PATH = pythonPath;
+}
+
+const monitorDebug = env.get('CTI_MONITOR_DEBUG');
+if (monitorDebug && !process.env.CTI_MONITOR_DEBUG) {
+  process.env.CTI_MONITOR_DEBUG = monitorDebug;
 }
 ```
 
-所有模型提供者（Extension、Window、Auto）都实现此接口。`streamChat` 返回一个 `ReadableStream<string>`，内容为SSE格式文本流：
+这个细节很重要。之前只把 `CTI_PYTHON_PATH` 注入了环境，`CTI_MONITOR_DEBUG=true` 写进 env 文件后 Python 脚本并不知道，导致调试 JSON 没有返回。
 
+## 4. 启动流程
+
+`src/main.ts` 做了这些事：
+
+1. `setupLogger()`
+2. `loadConfig()`
+3. `configToSettings()`
+4. 创建 `JsonFileStore`
+5. 根据 `CTI_RUNTIME` 创建 Provider
+6. `initBridgeContext()`
+7. 启动本地 API Server，端口 `3100`
+8. 创建 `FeishuAdapter`
+9. 调用 `bridgeManager.start(feishuAdapter)`
+
+Provider 选择逻辑：
+
+```ts
+if (config.runtime === 'window') {
+  llm = new WindowLLMProvider(config.messageTimeoutFirst, config.traeMsgSuffix);
+} else {
+  llm = new AutoLLMProvider(...);
+}
 ```
+
+当前项目实际主要使用 `window`。
+
+## 5. 飞书适配器
+
+文件：`src/feishu/feishu-adapter.ts`
+
+### 5.1 长连接
+
+飞书 SDK 使用 `WSClient`：
+
+```ts
+this.wsClient = new lark.WSClient({ appId, appSecret, domain });
+this.wsClient.start({ eventDispatcher: dispatcher });
+```
+
+事件注册：
+
+```ts
+new lark.EventDispatcher({}).register({
+  'im.message.receive_v1': async (data) => { ... },
+  'card.action.trigger': async (data) => { ... },
+});
+```
+
+### 5.2 接收消息
+
+接收流程：
+
+1. 取 `message_id`、`chat_id`、`sender_id`。
+2. 通过 `seenMessageIds` 去重。
+3. 忽略非用户消息。
+4. 解析 `text` 或 `post` 消息。
+5. 移除 @ 机器人 mention。
+6. 检查 `CTI_FEISHU_ALLOWED_USERS`。
+7. 封装成 `InboundMessage`。
+8. 放入 adapter 队列，等待 `BridgeManager` 消费。
+
+### 5.3 发送消息
+
+当前主要通过交互卡片发送：
+
+```ts
+const processedText = preprocessFeishuMarkdown(text);
+const cardJson = buildCardContent(processedText);
+return await this.sendCard(address.chatId, cardJson, replyToMessageId);
+```
+
+卡片方式比普通 post 更适合展示代码块、JSON 和较复杂的 Markdown。
+
+## 6. BridgeManager
+
+文件：`src/core/bridge-manager.ts`
+
+`BridgeManager` 是消息编排中心。
+
+### 6.1 消息循环
+
+`runMessageLoop()` 不断调用：
+
+```ts
+const msg = await adapter.consumeOne();
+handleMessage(adapter, msg);
+```
+
+### 6.2 handleMessage
+
+处理顺序：
+
+1. 写审计日志。
+2. 处理权限按钮回调。
+3. 处理 `/perm`、`/model`、`/mode`、`/help` 命令。
+4. 查找或创建飞书 chat 与本地 session 的绑定。
+5. 对同一个 session 加锁，避免并发消息互相覆盖。
+6. 调用 `engine.processMessage()`。
+7. 将结果通过 `deliver()` 发回飞书。
+
+### 6.3 会话绑定
+
+每个飞书 chat 会绑定一个 `ChannelBinding`：
+
+```ts
+{
+  channelType: 'feishu',
+  chatId,
+  sessionId,
+  workingDirectory,
+  model,
+  mode
+}
+```
+
+这样同一个群或私聊可以保留上下文。
+
+## 7. ConversationEngine
+
+文件：`src/core/conversation-engine.ts`
+
+它负责把一条飞书消息变成一次 Trae 调用。
+
+核心步骤：
+
+1. `store.acquireSessionLock()` 获取会话锁。
+2. `store.addMessage(sessionId, 'user', text)` 记录用户消息。
+3. 读取最近 50 条历史消息。
+4. 构造 `StreamChatParams`。
+5. 调用 `llm.streamChat(params)`。
+6. 消费 SSE 流。
+7. 把 assistant 回复写入消息历史。
+
+### 7.1 SSE 事件
+
+Provider 输出的流使用 SSE 文本格式：
+
+```text
 event: text
-data: "Hello"
-
-event: tool_use
-data: {"id":"tool_1","name":"read_file","status":"running"}
-
-event: permission_request
-data: {"permissionRequestId":"perm_123","toolName":"write_file"}
+data: "hello"
 
 event: result
-data: {"text":"...","tokenUsage":{...}}
+data: {"text":"hello","tokenUsage":null}
 
 event: done
 data: ""
 ```
 
-### 2.2 DI容器 (`context.ts`)
+`consumeStream()` 会处理：
 
-采用 `globalThis` 单例模式实现轻量级DI：
+| 事件 | 作用 |
+| --- | --- |
+| `text` | 累加回复文本 |
+| `result` | 保存最终文本、tokenUsage、sdkSessionId |
+| `tool_use` | 更新工具状态 |
+| `tool_result` | 标记工具完成 |
+| `permission_request` | 转发权限请求 |
+| `error` | 标记错误 |
 
-```typescript
-interface BridgeContext {
-  store: BridgeStore;        // 持久化存储
-  llm: LLMProvider;          // 模型提供者
-  permissions: PermissionGateway;  // 权限网关
-  lifecycle: LifecycleHooks;       // 生命周期钩子
-}
+## 8. WindowLLMProvider
+
+文件：`src/providers/window-provider.ts`
+
+窗口模式分两步：
+
+1. 调用 `scripts/trae_window.py` 发送消息。
+2. 调用 `scripts/trae_monitor.py` 读取回复。
+
+核心代码：
+
+```ts
+const sendResult = await execPython(TRAE_WINDOW_SCRIPT, [fullMessage], abortController);
+const monitorResult = await execPython(TRAE_MONITOR_SCRIPT, [String(monitorTimeoutSeconds), fullMessage], abortController);
 ```
 
-- `initBridgeContext(ctx)` — 在 `main.ts` 启动时调用一次
-- `getBridgeContext()` — 所有模块通过此函数获取依赖，无需传参
+### 8.1 超时
 
-**为什么不用第三方DI框架？** 本项目依赖关系简单且固定（4个核心依赖），使用 `globalThis` 单例足以满足需求，避免引入额外依赖。
+配置里的 `CTI_MESSAGE_TIMEOUT_FIRST` 是毫秒。Python 监测脚本参数是秒，所以 provider 会转换：
 
----
-
-## 3. 消息流转全链路
-
-### 3.1 入站消息流（飞书 → Trae CN）
-
-```
-用户在飞书发消息
-    │
-    ▼
-FeishuAdapter (WSClient长连接接收)
-    │ 解析消息内容、去重、鉴权
-    ▼
-FeishuAdapter.enqueue() → 消息队列
-    │
-    ▼
-BridgeManager.runMessageLoop() → consumeOne()
-    │
-    ▼
-BridgeManager.handleMessage()
-    ├── 1. 审计日志
-    ├── 2. 回调数据处理 (权限按钮点击)
-    ├── 3. 命令解析 (/mode, /model, /help, /perm)
-    ├── 4. 模式检测 (detectMode)
-    ├── 5. resolveBinding() → 获取/创建ChannelBinding
-    └── 6. processWithSessionLock() → 会话锁保证串行
-         │
-         ▼
-    ConversationEngine.processMessage()
-         ├── 获取会话锁 (acquireSessionLock)
-         ├── 记录用户消息 (addMessage)
-         ├── 构建对话历史 (getMessages, limit=50)
-         ├── 调用 LLMProvider.streamChat()
-         ├── 消费SSE流 (consumeStream)
-         │    ├── text事件 → onPartialText → FeishuAdapter.onStreamText()
-         │    ├── tool_use事件 → onToolEvent → 更新工具进度
-         │    └── permission_request → onPermissionRequest → PermissionBroker
-         └── 记录AI响应 (addMessage)
-              │
-              ▼
-    DeliveryLayer.deliver()
-         ├── 去重检查 (checkDedup)
-         ├── 文本分块 (chunkText, 飞书限制30000字符)
-         ├── 逐块发送 (sendWithRetry, 最多3次重试)
-         └── 审计日志
+```ts
+const monitorTimeoutSeconds = Math.ceil(monitorTimeout / 1000);
 ```
 
-### 3.2 出站消息流（Trae CN → 飞书）
+为了避免长回复过早截断，窗口模式当前最短等待 60 秒：
 
-**Extension API路径：**
-
-```
-ExtensionLLMProvider.streamChat()
-    │
-    ├── HTTP POST → Trae CN本地API (端口3000) /api/send-to-trae
-    │    Body: { message, model, workingDirectory }
-    │
-    └── 轮询 GET → /api/response/:sessionId (每2秒一次, 最多150次)
-         │
-         ▼
-    返回SSE流 → ConversationEngine消费
+```ts
+const monitorTimeoutMs = Math.max(this.timeout, 60000);
 ```
 
-**窗口自动化路径：**
+### 8.2 Python 路径
 
-```
-WindowLLMProvider.streamChat()
-    │
-    ├── execPython(trae_window.py, [message])
-    │    → pywinauto定位Trae窗口 → 粘贴消息 → 回车发送
-    │
-    └── execPython(trae_monitor.py, [timeout])
-         → 监控Trae响应区域文本变化 → 返回响应
+优先使用：
+
+```ts
+process.env.CTI_PYTHON_PATH
 ```
 
-### 3.3 会话绑定机制
+否则 Windows 上使用 `python`。
 
-每个飞书聊天（chatId）绑定一个 `ChannelBinding`，包含：
+## 9. 发送消息到 Trae
 
-- `sessionId` — 对话会话ID，关联消息历史
-- `sdkSessionId` — Trae CN SDK会话ID（用于续接对话）
-- `workingDirectory` — 工作目录
-- `model` — 当前模型
-- `mode` — 当前模式 (code/plan/ask)
+文件：`scripts/trae_window.py`
 
-首次消息时自动创建绑定，后续消息复用同一绑定。
+流程：
 
----
+1. 用 UIA 连接 Trae 窗口：
 
-## 4. 模型提供者体系
-
-### 4.1 AutoLLMProvider（自动降级）
-
-```
-AutoLLMProvider
-├── extensionProvider: ExtensionLLMProvider  (主路径)
-├── windowProvider: WindowLLMProvider        (降级路径)
-├── activeProvider: 'extension' | 'window'
-├── failCount: number                        (连续失败计数)
-└── COOLDOWN_MS = 5 * 60 * 1000             (冷却期5分钟)
+```py
+Application(backend="uia").connect(title_re=r".*Trae CN.*")
 ```
 
-**降级策略：**
+2. 聚焦窗口。
+3. 把消息写入剪贴板。
+4. 找到底部输入框：
 
-1. 默认使用 Extension API
-2. Extension 连续失败 3 次 → 切换到窗口自动化
-3. 冷却期 5 分钟后 → 自动重试 Extension
-4. 单次请求中 Extension 流失败 → 立即降级到窗口自动化处理该请求
-
-### 4.2 ExtensionLLMProvider
-
-通过HTTP与Trae CN本地API通信：
-
-| 步骤 | 方法 | 端点 | 说明 |
-|------|------|------|------|
-| 发送消息 | POST | `/api/send-to-trae` | 将用户消息转发到Trae CN |
-| 轮询响应 | GET | `/api/response/:sessionId` | 每2秒轮询一次，最多150次（5分钟） |
-
-**请求超时**：单次HTTP请求120秒，总轮询时间最长5分钟。
-
-### 4.3 WindowLLMProvider
-
-通过Python脚本实现窗口自动化：
-
-| 步骤 | 脚本 | 说明 |
-|------|------|------|
-| 注入消息 | `trae_window.py` | pywinauto定位Trae窗口 → 剪贴板粘贴 → 回车 |
-| 监控响应 | `trae_monitor.py` | 轮询Trae响应区域文本变化 |
-
-**限制**：
-- 仅Windows平台
-- 需要Trae CN窗口在前台可见
-- 依赖pywinauto和pyperclip
-
----
-
-## 5. 飞书适配器
-
-### 5.1 消息接收
-
-使用 `@larksuiteoapi/node-sdk` 的 `WSClient` 长连接模式接收消息：
-
-```typescript
-wsClient.start({
-  eventDispatcher: new lark.EventDispatcher({}).register({
-    'im.message.receive_v1': async (data) => { ... },
-    'card.action.trigger': async (data) => { ... },
-  })
-});
+```py
+edits = trae_win.descendants(control_type="Edit")
+for e in reversed(edits):
+    rect = e.rectangle()
+    if rect.bottom > 700 and rect.right > 1300:
+        chat_box = e
+        break
 ```
 
-**消息处理流程：**
+5. 点击输入框。
+6. `Ctrl+A`、`Ctrl+V`、`Enter`。
+7. 返回 JSON。
 
-1. **去重**：`seenMessageIds` Map 缓存最近1000条消息ID
-2. **过滤**：忽略非用户消息和机器人自身消息
-3. **解析**：支持text和post两种消息类型，提取纯文本
-4. **@提及清理**：移除@机器人的mention标记
-5. **鉴权**：检查用户是否在白名单内
-6. **附件处理**：下载图片等附件（通过 `im.messageResource.get`）
+## 10. 读取 Trae 回复
 
-### 5.2 消息发送
+文件：`scripts/trae_monitor.py`
 
-根据内容复杂度选择发送方式：
+这是本项目最容易出问题、也最有学习价值的部分。
 
-```
-hasComplexMarkdown(text)?
-    ├── Yes → 发送交互式卡片 (msg_type: 'interactive')
-    │         buildCardContent() → { schema: '2.0', body: { elements: [{ tag: 'markdown' }] } }
-    │
-    └── No  → 发送富文本帖子 (msg_type: 'post')
-              buildPostContent() → { zh_cn: { content: [[{ tag: 'md' }]] } }
-```
+### 10.1 为什么难
 
-**复杂Markdown判定**：包含代码块（\`\`\`）或表格（`|...|`）。
+Trae Builder 回复不是普通文本框，而是富文本 UI。Windows UIA 可能把一句自然语言拆成多个控件，例如：
 
-### 5.3 飞书Markdown预处理
-
-`preprocessFeishuMarkdown()` 处理飞书卡片Markdown的已知问题：
-- 代码块前必须换行：`text.replace(/([^\n])```/g, '$1\n```')`
-
-`htmlToFeishuMarkdown()` 将HTML转换为飞书兼容Markdown：
-- `<b>` → `**bold**`
-- `<code>` → `` `code` ``
-- HTML实体解码
-
----
-
-## 6. 流式输出机制
-
-### 6.1 消息编辑模拟
-
-飞书不支持真正的流式输出，通过**消息编辑API**模拟：
-
-```
-AI开始生成
-    │
-    ▼
-创建新消息 (im.message.create)
-    │ 内容: "正在思考..."
-    │
-    ▼ (每500ms)
-编辑消息 (im.message.patch)
-    │ 内容: 逐步追加AI生成的文本
-    │
-    ▼
-AI生成完成
-    │
-    ▼
-最终编辑 (im.message.patch)
-    │ 内容: 完整AI响应
+```text
+Text: 我看到你正在查看
+Text: Traecn_to_im
+Text: 项目中的
+Hyperlink: main.ts
+Text: 文件，第 69 行是
+Text: await bridgeManager.start(feishuAdapter);
 ```
 
-### 6.2 EditPreviewState
+还可能出现：
 
-```typescript
-interface EditPreviewState {
-  chatId: string;
-  messageId: string;          // 已创建的消息ID（用于后续编辑）
-  lastSentText: string;       // 上次发送的文本
-  lastSentAt: number;         // 上次发送时间戳
-  throttleTimer: Timer|null;  // 节流定时器
-  pendingText: string;        // 待发送的最新文本
-  activeTools: ToolCallInfo[];// 当前工具调用状态
-}
+- 灰底项目名 chip。
+- 蓝色文件名链接。
+- 代码片段。
+- 列表项。
+- 折叠的“思考过程”。
+- `任务完成` 状态。
+- 输入框中的 `@ Builder`。
+
+这些元素的坐标不一定等于自然阅读顺序。之前尝试用 `top/left` 排序会出现错序，尝试按高度修正又会截断跨行文本。
+
+### 10.2 当前策略
+
+当前 `trae_monitor.py` 使用两层策略：
+
+1. 普通模式：尝试读取最新 Builder 回复块并拼成文本。
+2. 调试模式：直接返回 raw UIA JSON，避免丢信息。
+
+调试模式开启：
+
+```env
+CTI_MONITOR_DEBUG=true
 ```
 
-**节流策略**：
-- 最小编辑间隔：500ms (`EDIT_THROTTLE_MS`)
-- 如果距离上次编辑不足500ms，设置定时器延迟发送
-- 新文本到达时取消旧定时器，更新 `pendingText`
+### 10.3 可见控件采集
 
-### 6.3 流式卡片
+`get_visible_text_items(win)`：
 
-当有工具调用时，使用 `buildStreamingCard()` 渲染带工具进度的卡片：
+1. 找到 Trae 输入框。
+2. 以输入框位置推断聊天区域范围。
+3. 遍历窗口 descendants。
+4. 只收集这些类型：
+
+```py
+{"Text", "Edit", "Document", "Hyperlink", "ListItem"}
+```
+
+5. 每个控件保存：
 
 ```json
 {
-  "schema": "2.0",
-  "header": {
-    "title": { "tag": "plain_text", "content": "🤖 Trae AI" },
-    "template": "blue"
-  },
-  "body": {
-    "elements": [
-      { "tag": "markdown", "content": "🔄 `read_file`\n✅ `write_file`" },
-      { "tag": "hr" },
-      { "tag": "markdown", "content": "AI生成的文本内容..." }
-    ]
-  }
+  "seq": 0,
+  "top": 324,
+  "bottom": 347,
+  "left": 1392,
+  "right": 1668,
+  "type": "Text",
+  "text": "你好！有什么我可以帮你的吗？"
 }
 ```
 
-### 6.4 Typing指示器
+### 10.4 Builder 块定位
 
-- `onMessageStart()` — 在用户消息上添加 ⌨️ 表情回应
-- `onMessageEnd()` — 删除表情回应
+`get_latest_builder_items(items)`：
 
----
+1. 找最后一个 `任务完成`。
+2. 从它往上找最近的整行 `Builder`。
+3. 取两者之间的控件。
+4. 过滤噪声，例如 `思考过程`、输入框提示等。
 
-## 7. 权限管理
+这个方向比“最后一个 Builder”稳定，因为输入框区域可能也有 `@ Builder`。
 
-### 7.1 权限请求流程
+### 10.5 raw UIA JSON 返回
 
-```
-Trae CN AI请求权限 (SSE: permission_request事件)
-    │
-    ▼
-PermissionBroker.forwardPermissionRequest()
-    │ 构建权限说明文本
-    │ 创建飞书交互卡片 (含Allow/Allow Session/Deny按钮)
-    ▼
-飞书用户点击按钮
-    │
-    ▼
-FeishuAdapter.handleCardAction()
-    ├── 更新卡片状态 (buildResolvedPermissionCard)
-    │   Allow → 绿色卡片 "✅ Permission Allowed"
-    │   Deny  → 红色卡片 "❌ Permission Denied"
-    └── 生成callbackData消息 → BridgeManager
-         │
-         ▼
-    PermissionBroker.handlePermissionCallback()
-         ├── 验证callbackData格式 (perm:action:id)
-         ├── 检查权限链接是否有效
-         ├── 标记为已解决 (markPermissionLinkResolved)
-         └── 调用 permissions.resolvePendingPermission()
-```
-
-### 7.2 权限卡片结构
+`build_raw_response()` 返回：
 
 ```json
 {
-  "schema": "2.0",
-  "header": {
-    "title": "⚠️ Permission Required",
-    "template": "orange"
-  },
-  "body": {
-    "elements": [
-      { "tag": "markdown", "content": "Tool: write_file\nInput: {...}" },
-      { "tag": "hr" },
-      {
-        "tag": "column_set",
-        "columns": [
-          { "tag": "button", "text": "✅ Allow", "type": "primary", "value": { "callback_data": "perm:allow:id123" } },
-          { "tag": "button", "text": "🔓 Allow Session", "type": "default", "value": { "callback_data": "perm:allow_session:id123" } },
-          { "tag": "button", "text": "❌ Deny", "type": "danger", "value": { "callback_data": "perm:deny:id123" } }
-        ]
-      }
-    ]
-  }
+  "mode": "raw_uia_block",
+  "items": [],
+  "lines": [],
+  "candidate": []
 }
 ```
 
-### 7.3 权限命令
+飞书会收到 fenced JSON：
 
-除了点击按钮，也可以通过文本命令：
-
-```
-/perm allow <permissionRequestId>     — 批准一次
-/perm allow_session <permissionRequestId>  — 批准本次会话
-/perm deny <permissionRequestId>      — 拒绝
-```
-
----
-
-## 8. 模式检测与多模型调度
-
-### 8.1 上下文感知模式检测 (`mode-detector.ts`)
-
-基于关键词评分的轻量级模式检测：
-
-```typescript
-detectMode(text: string, currentMode: BridgeMode): ModeDetectionResult
-```
-
-**关键词分类：**
-
-| 模式 | 关键词示例 | 含义 |
-|------|-----------|------|
-| code | 写、实现、修复、修改、bug、重构、测试 | AI可读写执行代码 |
-| plan | 计划、规划、方案、设计、架构、如何 | AI先规划再审批 |
-| ask | 解释、什么是、为什么、帮助、文档 | 仅问答不修改代码 |
-
-**评分算法：**
-
-```
-planScore = count(text ∩ PLAN_KEYWORDS)
-askScore  = count(text ∩ ASK_KEYWORDS)
-codeScore = count(text ∩ CODE_KEYWORDS)
-
-confidence = maxScore / (totalScore + 1)  // +1避免除零
-
-if confidence > 0.5 && detectedMode != currentMode:
-    切换模式
-```
-
-**仅在 `code` 模式下启用自动检测**（`shouldAutoDetect(binding)` 返回 `binding.mode === 'code'`），避免在用户已手动选择 plan/ask 时被覆盖。
-
-### 8.2 多模型调度
-
-通过飞书命令切换模型：
-
-```
-/model claude-3.5-sonnet
-/model gpt-4o
-```
-
-切换后模型名持久化到 `BridgeSession.model`，后续请求自动使用新模型。
-
-### 8.3 模式切换命令
-
-```
-/mode code  → 💻 Code Mode — AI can read, write, and execute code
-/mode plan  → 📋 Plan Mode — AI plans first, then asks for approval
-/mode ask   → ❓ Ask Mode — AI answers questions without code changes
-```
-
-模式持久化到 `ChannelBinding.mode`。
-
----
-
-## 9. 存储层
-
-### 9.1 JsonFileStore
-
-基于JSON文件的持久化存储，数据目录：`~/.traecn-to-feishu/data/`
-
-**文件结构：**
-
-```
-~/.traecn-to-feishu/
-├── config.env              # 配置文件
-├── data/
-│   ├── sessions.json       # 会话数据
-│   ├── bindings.json       # 通道绑定
-│   ├── permissions.json    # 权限链接
-│   ├── offsets.json        # 消息偏移量
-│   ├── dedup.json          # 去重键
-│   ├── audit.json          # 审计日志
-│   └── messages/
-│       ├── <sessionId>.json  # 每个会话的消息历史
-│       └── ...
-└── logs/
-    ├── bridge.log          # 当前日志
-    ├── bridge.log.1        # 轮转日志
-    └── ...
-```
-
-### 9.2 写入安全
-
-- **原子写入**：先写 `.tmp` 文件，再 `fs.renameSync` 替换，防止写入中断导致数据损坏
-- **会话锁**：`acquireSessionLock()` / `releaseSessionLock()` 防止并发处理同一会话
-  - 锁有TTL（默认600秒），自动过期
-  - 处理过程中每60秒续约一次
-
-### 9.3 数据清理
-
-- **去重键**：`cleanupExpiredDedup()` 清理24小时前的去重记录
-- **审计日志**：超过10000条时裁剪到5000条
-- **消息ID缓存**：超过1000条时裁剪
-
----
-
-## 10. API Server
-
-### 10.1 概述
-
-桥接守护进程启动时在端口3100启动HTTP API Server，用于：
-1. 接收Trae CN扩展回传的AI响应
-2. 提供健康检查和状态查询
-3. 支持外部程序发送消息到Trae CN
-
-### 10.2 端点详情
-
-| 端点 | 方法 | 请求体 | 响应 | 说明 |
-|------|------|--------|------|------|
-| `/health` | GET | — | `{ status, running, startedAt, adapters }` | 健康检查 |
-| `/api/config` | GET | — | `{ status }` | 配置状态 |
-| `/api/send-to-trae` | POST | `{ message, model?, workingDirectory? }` | `{ success, message }` | 转发消息到Trae |
-| `/api/ai-response` | POST | `{ session_id, content, user_message_id? }` | `{ success }` | Trae回传AI响应 |
-| `/api/response/:id` | GET | — | `{ success, content }` | 轮询获取响应 |
-| `/api/status` | GET | — | `{ running, startedAt, adapters }` | 桥接状态 |
-
-### 10.3 响应等待机制
-
-API Server内部使用 `Promise` + `Map` 实现异步响应等待：
-
-```typescript
-const pendingResponses = new Map<string, PendingResponse>();
-
-// Extension Provider 发送消息后轮询
-waitForResponse(sessionId) → Promise<string>
-    // 创建Promise，存入Map，设置120秒超时定时器
-
-// Trae CN扩展回传响应时
-registerResponse(sessionId, text)
-    // 从Map取出Promise，resolve(text)，清除定时器
-```
-
-### 10.4 认证
-
-- 可选的Token认证：在 `config.env` 中设置 `CTI_BRIDGE_API_TOKEN`
-- 请求时通过 `x-Bridge-Token` Header传递
-- 未配置Token时跳过认证
-
----
-
-## 11. 安全设计
-
-### 11.1 输入校验 (`validators.ts`)
-
-```typescript
-sanitizeInput(text: string): string
-    // 1. 移除控制字符 (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F)
-    // 2. 截断到50000字符
-
-isDangerousInput(text: string): boolean
-    // 检测路径遍历 (../) 和命令注入字符 (<>|&;`$)
-```
-
-### 11.2 日志脱敏 (`logger.ts`)
-
-自动遮蔽以下敏感信息：
-
-| 模式 | 示例 | 脱敏后 |
-|------|------|--------|
-| App Secret | `CTI_FEISHU_APP_SECRET=abc123` | `CTI_FEISHU_APP_SECRET=****` |
-| Bearer Token | `Bearer eyJhbGci...` | `****` |
-| Access Token | `tenant_access_token: abc123` | `tenant_access_token: ****` |
-
-### 11.3 用户白名单
-
-`CTI_FEISHU_ALLOWED_USERS` 配置项限制可交互的飞书用户，逗号分隔的 `open_id` 列表。留空则允许所有人。
-
-### 11.4 消息去重
-
-- `checkDedup(key)` / `insertDedup(key)` — 防止重复处理同一条消息
-- 去重键24小时后自动过期
-- 投递层也使用去重防止重复发送
-
----
-
-## 12. 配置系统
-
-### 12.1 配置文件
-
-路径：`~/.traecn-to-feishu/config.env`
-
-格式：`KEY=VALUE`，支持 `#` 注释，支持引号包裹值。
-
-### 12.2 配置项一览
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `CTI_RUNTIME` | `auto` | 运行模式: `window` / `extension` / `auto` |
-| `CTI_ENABLED_CHANNELS` | `feishu` | 启用的IM通道 |
-| `CTI_DEFAULT_WORKDIR` | `process.cwd()` | 默认工作目录 |
-| `CTI_DEFAULT_MODEL` | — | 默认AI模型 |
-| `CTI_DEFAULT_MODE` | `code` | 默认模式 |
-| `CTI_FEISHU_APP_ID` | — | 飞书应用App ID（必填） |
-| `CTI_FEISHU_APP_SECRET` | — | 飞书应用App Secret（必填） |
-| `CTI_FEISHU_DOMAIN` | `feishu` | 飞书域名: `feishu`(国内) / `lark`(海外) |
-| `CTI_FEISHU_ALLOWED_USERS` | — | 允许的用户open_id列表 |
-| `CTI_FEISHU_CHAT_ID` | — | 默认飞书聊天ID |
-| `CTI_MESSAGE_TIMEOUT_FIRST` | `20000` | 首次超时(ms) |
-| `CTI_MESSAGE_TIMEOUT_RETRY` | `20000` | 重试超时(ms) |
-| `CTI_TRAE_MSG_SUFFIX` | — | 追加到Trae消息的后缀 |
-| `CTI_AUTO_APPROVE` | `false` | 自动批准权限请求 |
-
-### 12.3 配置加载流程
-
-```
-main.ts
-    │
-    ▼
-loadConfig()
-    ├── 尝试读取 config.env
-    ├── 解析 KEY=VALUE 格式
-    ├── 应用默认值
-    └── 返回 Config 对象
-    │
-    ▼
-configToSettings(config)
-    └── 转换为 Map<string, string> 供 JsonFileStore 使用
-```
-
----
-
-## 13. 日志系统
-
-### 13.1 日志格式
-
-```
-[2025-01-15T10:30:45.123Z] [info] [feishu-adapter] Started (botOpenId: ou_xxx)
-[2025-01-15T10:30:46.456Z] [warn] [auto-provider] Extension failed (fail count: 2)
-[2025-01-15T10:30:47.789Z] [error] [bridge-manager] Message handling error: timeout
-```
-
-### 13.2 日志轮转
-
-- 单文件最大 10MB (`MAX_LOG_SIZE`)
-- 最多保留 5 个轮转文件 (`MAX_LOG_FILES`)
-- 轮转命名：`bridge.log` → `bridge.log.1` → `bridge.log.2` → ...
-
-### 13.3 日志级别
-
-| 级别 | 输出位置 | 用途 |
-|------|---------|------|
-| debug | 文件 | 调试信息 |
-| info | 文件 | 正常运行信息 |
-| warn | 文件 + stderr | 警告 |
-| error | 文件 + stderr | 错误 |
-
----
-
-## 14. 部署与运维
-
-### 14.1 构建与运行
-
-```powershell
-# 安装依赖
-npm install
-
-# 开发模式
-npm run dev
-
-# 生产构建
-npm run build
-
-# 生产运行
-npm start
-```
-
-### 14.2 健康检查
-
-```powershell
-# 检查守护进程状态
-curl http://127.0.0.1:3100/health
-
-# 响应示例
+````markdown
+```json
 {
-  "status": "ok",
-  "running": true,
-  "startedAt": "2025-01-15T10:30:00.000Z",
-  "adapters": [{
-    "channelType": "feishu",
-    "running": true,
-    "connectedAt": "2025-01-15T10:30:00.000Z",
-    "lastMessageAt": null,
-    "error": null
-  }]
+  "mode": "raw_uia_block",
+  "items": [...]
 }
 ```
+````
 
-### 14.3 日志查看
+这是一种务实的降级方式：当自动还原文本不稳定时，不再让桥接服务猜测顺序，而是把真实 UIA 信息交给用户查看。
+
+## 11. dump_ui.py 调试
+
+文件：`scripts/dump_ui.py`
+
+运行：
 
 ```powershell
-# 查看最新日志
-Get-Content "$env:USERPROFILE\.traecn-to-feishu\logs\bridge.log" -Tail 50
-
-# 实时跟踪日志
-Get-Content "$env:USERPROFILE\.traecn-to-feishu\logs\bridge.log" -Wait -Tail 20
+D:/tmp/MiniConda/python.exe scripts/dump_ui.py
 ```
 
-### 14.4 数据目录
+输出格式：
 
-```
-%USERPROFILE%\.traecn-to-feishu\
-├── config.env           # 配置
-├── data\                # 持久化数据
-│   ├── sessions.json
-│   ├── bindings.json
-│   ├── permissions.json
-│   ├── offsets.json
-│   ├── dedup.json
-│   ├── audit.json
-│   └── messages\
-└── logs\                # 日志
-    ├── bridge.log
-    └── bridge.log.1
+```text
+0324,1392,0347,1668 Text: 你好！有什么我可以帮你的吗？
+0368,1548,0391,1677 Text: Traecn_to_im
+0368,1768,0391,1852 Hyperlink: main.ts
 ```
 
-可通过环境变量 `CTI_HOME` 覆盖数据根目录。
+字段含义：
 
-### 14.5 故障排查
+```text
+top,left,bottom,right control_type: text
+```
 
-| 问题 | 排查步骤 |
-|------|---------|
-| 飞书收不到消息 | 检查 App ID/Secret 是否正确，确认事件订阅已配置长连接 |
-| Trae CN无响应 | 检查Trae CN是否运行，窗口自动化模式需Trae在前台 |
-| 消息发送失败 | 检查飞书应用权限（im:message:send_as_bot） |
-| 权限卡片不显示 | 检查飞书应用是否开启了卡片交互能力 |
-| Extension API连接失败 | 检查Trae CN本地API是否在端口3000运行 |
-| 自动降级频繁触发 | 检查Extension API可用性，查看日志中fail count |
+这是定位 UIA 错序、缺失、隐藏元素的主要工具。
+
+## 12. raw JSON 与普通文本的取舍
+
+### 普通文本优点
+
+- 飞书里更容易读。
+- 对简单回复体验好。
+
+### 普通文本缺点
+
+- Trae 富文本控件顺序可能错。
+- 思考过程、链接、代码片段、列表项都可能影响解析。
+- 不同 Trae 版本、模型和 UI 缩放比例下行为可能变化。
+
+### raw UIA JSON 优点
+
+- 信息不丢。
+- 可复现。
+- 用户可以自己识别有效字段。
+- 方便继续优化解析算法。
+
+### raw UIA JSON 缺点
+
+- 飞书消息更长。
+- 可读性不如自然语言。
+
+当前建议：调试阶段保持 `CTI_MONITOR_DEBUG=true`。确认某个 Trae 版本和缩放设置下解析足够稳定后，再关闭 debug。
+
+## 13. 本地 HTTP API
+
+文件：`src/api-server.ts`
+
+默认端口：
+
+```text
+3100
+```
+
+端点：
+
+| 端点 | 方法 | 用途 |
+| --- | --- | --- |
+| `/health` | GET | 健康检查 |
+| `/api/config` | GET | 配置状态 |
+| `/api/status` | GET | 桥接状态 |
+| `/api/send-to-trae` | POST | 发送消息到 Trae |
+| `/api/ai-response` | POST | 外部写入 AI 回复 |
+| `/api/response/:id` | GET | 查询回复 |
+
+这个 API 主要为 extension/auto 路线预留，也方便本地调试。
+
+## 14. 存储系统
+
+文件：`src/store.ts`
+
+数据目录：
+
+```text
+.traecn-to-feishu/data/
+```
+
+常见文件：
+
+| 文件 | 说明 |
+| --- | --- |
+| `sessions.json` | 会话元数据 |
+| `bindings.json` | 飞书 chat 与 session 绑定 |
+| `offsets.json` | 消息偏移 |
+| `audit.json` | 审计日志 |
+| `messages/<sessionId>.json` | 会话消息 |
+
+写入方式使用临时文件 + rename，降低写坏 JSON 的概率。
+
+## 15. 日志
+
+日志文件：
+
+```text
+.traecn-to-feishu/logs/bridge.log
+```
+
+查看：
+
+```powershell
+Get-Content .traecn-to-feishu/logs/bridge.log -Tail 80
+```
+
+日志会遮蔽常见敏感字段，例如 App Secret、Bearer Token。
+
+## 16. 安全边界
+
+这个项目会自动向 Trae 发送用户消息。使用时要注意：
+
+- 不要把机器人加入不可信群。
+- 可以用 `CTI_FEISHU_ALLOWED_USERS` 限制用户。
+- 不要把 `config.env` 上传到 GitHub。
+- Trae 可能执行代码编辑或命令，取决于当前模型和模式。
+- raw UIA JSON 可能包含当前 IDE 窗口里可见的路径、代码、聊天文本。
+
+## 17. 与参考项目的关系
+
+本地参考项目 `feishu-toTrae-bot/` 主要实现了：
+
+- 飞书接收消息。
+- 使用 Python 脚本把消息发送到 Trae 窗口。
+
+它没有完整实现“读取 Trae Builder 回复并回传飞书”。本项目在参考发送思路的基础上，增加了：
+
+- 飞书长连接事件适配。
+- Node/TypeScript 模块化桥接。
+- Trae 回复监测。
+- raw UIA JSON 调试。
+- 会话、绑定、审计等 JSON 存储。
+
+## 18. 常见问题
+
+### 18.1 为什么飞书只收到一小段回复
+
+通常是 Trae UIA 富文本拆分导致。开启：
+
+```env
+CTI_MONITOR_DEBUG=true
+```
+
+然后重启服务，让飞书直接收到 raw UIA JSON。
+
+### 18.2 为什么写了 CTI_MONITOR_DEBUG 但没生效
+
+需要确认：
+
+1. 写在 `.traecn-to-feishu/config.env`。
+2. 重启 Node 服务。
+3. 当前代码包含 `src/config.ts` 中对 `CTI_MONITOR_DEBUG` 的注入逻辑。
+
+### 18.3 为什么 Python 运行失败
+
+检查：
+
+```powershell
+D:/tmp/MiniConda/python.exe --version
+D:/tmp/MiniConda/python.exe -c "import pywinauto, pyperclip; print('ok')"
+```
+
+然后确认：
+
+```env
+CTI_PYTHON_PATH=D:/tmp/MiniConda/python.exe
+```
+
+### 18.4 为什么找不到 Trae 窗口
+
+脚本按窗口标题匹配：
+
+```py
+r".*Trae CN.*"
+r".*Trae.*"
+```
+
+确保 Trae CN 已打开，且不是最小化状态。
+
+## 19. 后续可改进方向
+
+- 为 Trae UIA 回复解析增加可配置策略。
+- 把 raw UIA JSON 写入本地文件，飞书只发摘要和文件路径。
+- 引入 OCR 作为窗口读取兜底。
+- 如果 Trae 提供稳定 API，优先使用 API，减少窗口自动化。
+- 为 `trae_monitor.py` 增加基于 dump fixture 的单元测试。
+- 增加独立诊断命令，自动检查 Python、pywinauto、Trae 窗口和飞书连接。
