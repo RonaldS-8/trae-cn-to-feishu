@@ -19,7 +19,7 @@ export interface Config {
   autoApprove: boolean;
 }
 
-export const CTI_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.traecn-to-feishu');
+export const CTI_HOME = process.env.CTI_HOME || path.join(process.cwd(), '.traecn-to-feishu');
 export const CONFIG_PATH = path.join(CTI_HOME, 'config.env');
 
 function parseEnvFile(content: string): Map<string, string> {
@@ -54,6 +54,15 @@ export function loadConfig(): Config {
     env = parseEnvFile(content);
   } catch {
     // config file not found, use defaults
+  }
+
+  const pythonPath = env.get('CTI_PYTHON_PATH');
+  if (pythonPath && !process.env.CTI_PYTHON_PATH) {
+    process.env.CTI_PYTHON_PATH = pythonPath;
+  }
+  const monitorDebug = env.get('CTI_MONITOR_DEBUG');
+  if (monitorDebug && !process.env.CTI_MONITOR_DEBUG) {
+    process.env.CTI_MONITOR_DEBUG = monitorDebug;
   }
 
   const rawRuntime = env.get('CTI_RUNTIME') || 'window';

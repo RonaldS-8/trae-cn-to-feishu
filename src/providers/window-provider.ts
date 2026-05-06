@@ -19,6 +19,7 @@ export class WindowLLMProvider implements LLMProvider {
   streamChat(params: StreamChatParams): ReadableStream<string> {
     const { prompt, abortController } = params;
     const fullMessage = prompt + this.msgSuffix;
+    const monitorTimeoutMs = Math.max(this.timeout, 60000);
 
     return new ReadableStream<string>({
       start(controller) {
@@ -34,8 +35,9 @@ export class WindowLLMProvider implements LLMProvider {
 
             controller.enqueue(sseEvent('status', JSON.stringify({ status: 'message_sent' })));
 
-            const monitorTimeout = Math.max(params.abortController.signal.aborted ? 0 : 60000, 10000);
-            const monitorResult = await execPython(TRAE_MONITOR_SCRIPT, [String(monitorTimeout)], abortController);
+            const monitorTimeout = params.abortController.signal.aborted ? 0 : monitorTimeoutMs;
+            const monitorTimeoutSeconds = Math.ceil(monitorTimeout / 1000);
+            const monitorResult = await execPython(TRAE_MONITOR_SCRIPT, [String(monitorTimeoutSeconds), fullMessage], abortController);
 
             if (monitorResult.success && monitorResult.response) {
               controller.enqueue(sseEvent('text', monitorResult.response));
@@ -83,7 +85,7 @@ interface PythonResult {
 
 function execPython(scriptPath: string, args: string[], abortController: AbortController): Promise<PythonResult> {
   return new Promise((resolve, reject) => {
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const pythonCmd = process.env.CTI_PYTHON_PATH || (process.platform === 'win32' ? 'python' : 'python3');
     const proc = execFile(
       pythonCmd,
       [scriptPath, ...args],
@@ -94,7 +96,8 @@ function execPython(scriptPath: string, args: string[], abortController: AbortCo
           return;
         }
         if (error && !stdout) {
-          resolve({ success: false, error: error.message });
+          const detail = stderr.trim().split('\n').pop() || error.message;
+          resolve({ success: false, error: detail });
           return;
         }
         try {
@@ -102,7 +105,7 @@ function execPython(scriptPath: string, args: string[], abortController: AbortCo
           const result = JSON.parse(lastLine) as PythonResult;
           resolve(result);
         } catch {
-          resolve({ success: false, error: stdout.trim() || stderr.trim() || 'Unknown error' });
+          resolve({ success: false, error: stderr.trim() || stdout.trim() || 'Unknown error' });
         }
       },
     );

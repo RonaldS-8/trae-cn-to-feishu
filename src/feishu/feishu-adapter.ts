@@ -87,7 +87,12 @@ export class FeishuAdapter {
 
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: unknown) => {
-        await this.handleIncomingEvent(data as FeishuMessageEventData);
+        console.log('[feishu-adapter] Received message event');
+        try {
+          await this.handleIncomingEvent(data as FeishuMessageEventData);
+        } catch (err) {
+          console.error('[feishu-adapter] Error in handleIncomingEvent:', err);
+        }
       },
       'card.action.trigger': (async (data: unknown) => {
         return await this.handleCardAction(data);
@@ -174,12 +179,8 @@ export class FeishuAdapter {
       }
 
       const processedText = preprocessFeishuMarkdown(text);
-      if (hasComplexMarkdown(processedText)) {
-        const cardJson = buildCardContent(processedText);
-        return await this.sendCard(address.chatId, cardJson, replyToMessageId);
-      }
-
-      return await this.sendPost(address.chatId, processedText, replyToMessageId);
+      const cardJson = buildCardContent(processedText);
+      return await this.sendCard(address.chatId, cardJson, replyToMessageId);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error('[feishu-adapter] Send failed:', errorMsg);
@@ -275,20 +276,10 @@ export class FeishuAdapter {
     else this.queue.push(msg);
   }
 
-  private async resolveBotIdentity(appId: string, appSecret: string, domain: lark.Domain): Promise<void> {
-    try {
-      const tempClient = new lark.Client({ appId, appSecret, domain });
-      const resp = await (tempClient as any).bot.info.get();
-      const botInfo = resp?.data?.bot;
-      if (botInfo) {
-        this.botOpenId = botInfo.open_id || null;
-        if (botInfo.open_id) this.botIds.add(botInfo.open_id);
-        if (botInfo.user_id) this.botIds.add(botInfo.user_id);
-        if (botInfo.union_id) this.botIds.add(botInfo.union_id);
-      }
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to resolve bot identity:', err instanceof Error ? err.message : err);
-    }
+  private async resolveBotIdentity(_appId: string, _appSecret: string, _domain: lark.Domain): Promise<void> {
+    // TODO: SDK v1.43.0 中 bot.info API 已变更，需要查找新的调用方式
+    // 当前跳过 bot 身份验证，功能不受影响（仅无法过滤机器人自己的消息）
+    console.log('[feishu-adapter] Bot identity resolution skipped (SDK API changed in v1.43.0)');
   }
 
   private async handleIncomingEvent(data: FeishuMessageEventData): Promise<void> {
@@ -414,7 +405,7 @@ export class FeishuAdapter {
             const resolvedCard = buildResolvedPermissionCard('Permission request', action);
             await this.restClient.im.message.patch({
               path: { message_id: messageId },
-              data: { content: JSON.stringify({ type: 'card', data: JSON.parse(resolvedCard) }) },
+              data: { content: resolvedCard },
             });
           } catch { /* best effort */ }
         }
@@ -439,17 +430,16 @@ export class FeishuAdapter {
   private async sendCard(chatId: string, cardJson: string, replyToMessageId?: string): Promise<SendResult> {
     if (!this.restClient) return { ok: false, error: 'Adapter not running' };
     try {
-      const content = JSON.stringify({ type: 'card', data: JSON.parse(cardJson) });
       let resp;
       if (replyToMessageId) {
         resp = await this.restClient.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'interactive' },
+          data: { content: cardJson, msg_type: 'interactive' },
         });
       } else {
         resp = await this.restClient.im.message.create({
           params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, msg_type: 'interactive', content },
+          data: { receive_id: chatId, msg_type: 'interactive', content: cardJson },
         });
       }
       const msgId = (resp as any)?.data?.message_id;
@@ -497,15 +487,10 @@ export class FeishuAdapter {
 
     const hasTools = state.activeTools.length > 0;
     const content = hasTools
-      ? JSON.stringify({ type: 'card', data: JSON.parse(buildStreamingCard(text, state.activeTools)) })
-      : (() => {
-          const processedText = preprocessFeishuMarkdown(text);
-          return hasComplexMarkdown(processedText)
-            ? JSON.stringify({ type: 'card', data: JSON.parse(buildCardContent(processedText)) })
-            : JSON.stringify({ type: 'post', data: JSON.parse(buildPostContent(processedText)) });
-        })();
+      ? buildStreamingCard(text, state.activeTools)
+      : buildCardContent(preprocessFeishuMarkdown(text));
 
-    const msgType = hasTools || hasComplexMarkdown(preprocessFeishuMarkdown(text)) ? 'interactive' : 'post';
+    const msgType = 'interactive';
 
     if (state.messageId) {
       this.restClient.im.message.patch({

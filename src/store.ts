@@ -21,9 +21,29 @@ function ensureDir(dir: string): void {
 }
 
 function atomicWrite(filePath: string, data: string): void {
-  const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, data, 'utf-8');
-  fs.renameSync(tmp, filePath);
+  const tmp = filePath + '.tmp.' + Date.now();
+  try {
+    fs.writeFileSync(tmp, data, 'utf-8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    if ((err as NodeJS.ErrnoException).code === 'EPERM') {
+      try {
+        fs.writeFileSync(filePath, data, 'utf-8');
+      } catch (err2) {
+        if ((err2 as NodeJS.ErrnoException).code === 'EPERM') {
+          console.warn(`[store] EPERM writing ${filePath}, retrying in 100ms...`);
+          setTimeout(() => {
+            fs.writeFileSync(filePath, data, 'utf-8');
+          }, 100);
+        } else {
+          throw err2;
+        }
+      }
+    } else {
+      throw err;
+    }
+  }
 }
 
 function readJson<T>(filePath: string, fallback: T): T {

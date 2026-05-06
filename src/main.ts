@@ -1,6 +1,8 @@
 import { JsonFileStore } from './store.js';
 import { FeishuAdapter } from './feishu/feishu-adapter.js';
 import { AutoLLMProvider } from './providers/auto-provider.js';
+import { WindowLLMProvider } from './providers/window-provider.js';
+import type { LLMProvider } from './core/host.js';
 import { initBridgeContext } from './core/context.js';
 import * as bridgeManager from './core/bridge-manager.js';
 import { createApiServer } from './api-server.js';
@@ -18,15 +20,20 @@ async function main(): Promise<void> {
 
   const store = new JsonFileStore(settingsMap);
 
-  const extensionHost = settingsMap.get('bridge_extension_host') || '127.0.0.1';
-  const extensionPort = parseInt(settingsMap.get('bridge_extension_port') || '3000', 10);
-
-  const llm = new AutoLLMProvider(
-    extensionHost,
-    extensionPort,
-    config.traeMsgSuffix,
-    config.messageTimeoutFirst,
-  );
+  let llm: LLMProvider;
+  if (config.runtime === 'window') {
+    logger.info('Using WindowLLMProvider (window automation mode)');
+    llm = new WindowLLMProvider(config.messageTimeoutFirst, config.traeMsgSuffix);
+  } else {
+    const extensionHost = settingsMap.get('bridge_extension_host') || '127.0.0.1';
+    const extensionPort = parseInt(settingsMap.get('bridge_extension_port') || '3000', 10);
+    llm = new AutoLLMProvider(
+      extensionHost,
+      extensionPort,
+      config.traeMsgSuffix,
+      config.messageTimeoutFirst,
+    );
+  }
 
   const permissions = {
     resolvePendingPermission: (_id: string, _resolution: { behavior: 'allow' | 'deny'; message?: string }) => {
@@ -60,7 +67,8 @@ async function main(): Promise<void> {
 
   try {
     await bridgeManager.start(feishuAdapter);
-    logger.info(`Bridge is running (provider: ${llm.getActiveProvider()}). Press Ctrl+C to stop.`);
+    const providerName = 'getActiveProvider' in llm ? (llm as any).getActiveProvider() : 'window';
+    logger.info(`Bridge is running (provider: ${providerName}). Press Ctrl+C to stop.`);
   } catch (err) {
     logger.error('Failed to start bridge:', err instanceof Error ? err.message : err);
     process.exit(1);
@@ -70,4 +78,8 @@ async function main(): Promise<void> {
 main().catch(err => {
   console.error('Fatal error:', err);
   process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
 });

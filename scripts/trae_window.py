@@ -3,23 +3,36 @@ import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from pywinauto import Desktop
+from pywinauto import Application
 import time
 import pyperclip
 import json
 
-def send_to_trae(message):
-    desktop = Desktop(backend="uia")
+def find_trae_app():
     try:
-        pyperclip.copy(message)
-        time.sleep(0.2)
+        app = Application(backend="uia").connect(title_re=r".*Trae CN.*")
+        return app
+    except Exception:
+        pass
+    try:
+        app = Application(backend="uia").connect(title_re=r".*Trae.*")
+        return app
+    except Exception:
+        raise Exception("No Trae window found. Is Trae CN running?")
 
-        trae_win = desktop.window(title_re=r".*Trae.*")
-        trae_win.wait('visible', timeout=8)
+def send_to_trae(message):
+    try:
+        app = find_trae_app()
+        trae_win = app.top_window()
         trae_win.set_focus()
         time.sleep(0.5)
 
+        pyperclip.copy(message)
+        time.sleep(0.2)
+
         edits = trae_win.descendants(control_type="Edit")
+        if not edits:
+            raise Exception("No input box found in Trae window")
         chat_box = edits[-1]
 
         chat_box.click_input()

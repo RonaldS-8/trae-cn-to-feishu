@@ -65,3 +65,13 @@ traecn-to-feishu/
 ├── tsconfig.json
 └── tsconfig.build.json
 ```
+
+## 已知问题与修复计划
+
+### 🔴 问题1: SDK v1.43.0 中 bot.info API 变更
+- **位置**: `src/feishu/feishu-adapter.ts` → `resolveBotIdentity()`
+- **现象**: 启动时报错 `Cannot read properties of undefined (reading 'info')`
+- **原因**: `@larksuiteoapi/node-sdk` v1.43.0 中 `client.bot` 模块已被移除或重构
+- **当前处理**: 已跳过 bot 身份验证，功能不受影响（仅无法过滤机器人自己的消息）
+- **修复方案**: 需要查找新 SDK 中获取 bot 信息的正确 API，可能通过 `application.application.get()` 或其他路径
+- **优先级**: 低
