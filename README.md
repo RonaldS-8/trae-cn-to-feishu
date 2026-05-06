@@ -78,15 +78,15 @@ npm install
 CTI_RUNTIME=window
 
 # 飞书应用凭证
-CTI_FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
-CTI_FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+CTI_FEISHU_APP_ID=YOUR_API_KEY_HERE
+CTI_FEISHU_APP_SECRET=YOUR_API_KEY_HERE
 CTI_FEISHU_DOMAIN=feishu
 
 # 可选：限制允许使用机器人的飞书用户 open_id，留空则不限制
 CTI_FEISHU_ALLOWED_USERS=
 
 # Trae CN 当前项目目录
-CTI_DEFAULT_WORKDIR=D:/path/to/your/project
+CTI_DEFAULT_WORKDIR=YOUR_PROJECT_PATH_HERE
 
 # Trae 模型名，仅用于记录/提示，不保证能切换 Trae UI 内部模型
 CTI_DEFAULT_MODEL=MiniMax-M2
@@ -96,7 +96,7 @@ CTI_DEFAULT_MODE=code
 CTI_TRAE_MSG_SUFFIX=
 
 # Python 路径。系统 python 不可靠时建议写绝对路径
-CTI_PYTHON_PATH=D:/tmp/MiniConda/python.exe
+CTI_PYTHON_PATH=YOUR_PYTHON_PATH_HERE
 
 # 首次等待和重试等待，单位毫秒。窗口模式内部最短会按 60 秒等待
 CTI_MESSAGE_TIMEOUT_FIRST=20000
@@ -252,7 +252,7 @@ CTI_MONITOR_DEBUG=true
 ### 查看 Trae 当前窗口 UIA
 
 ```powershell
-D:/tmp/MiniConda/python.exe scripts/dump_ui.py
+python scripts/dump_ui.py
 ```
 
 这会输出所有可见控件的位置、类型和文本。
